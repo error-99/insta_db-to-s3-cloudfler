@@ -5,11 +5,13 @@ MemoriesBangla cron worker
 - /        : ok
 """
 import os
+import json
 import time
 import fcntl
 import logging
-import mimetypes
+import hashlib
 import threading
+from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
 
 import boto3
@@ -46,6 +48,10 @@ CFG = {
 
     # Items processed per cron hit
     "BATCH_SIZE": int(os.getenv("BATCH_SIZE", "2")),
+
+    # Retry: try each task this many times, then skip it
+    "MAX_RETRIES": int(os.getenv("MAX_RETRIES", "3")),
+    "RETRY_DELAY": int(os.getenv("RETRY_DELAY", "3")),  # seconds (x attempt number)
 }
 
 LOCK_FILE = "/tmp/memoriesbangla_cron.lock"
@@ -118,25 +124,95 @@ def fetch_rapid(insta_url):
     return j
 
 
-# ============================== STEP 3: download -> R2 ==============================
-def upload_to_r2(item_id, download_url, shortcode):
+# ============================== STEP 3: download -> R2 (original quality) ==============================
+IG_HOSTS = ("instagram.com", "instagr.am")
+IG_PATHS = ("/reel/", "/reels/", "/p/", "/tv/", "/stories/")
+
+EXT_MAP = {
+    "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm",
+    "video/x-matroska": "mkv", "video/3gpp": "3gp",
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+    "image/webp": "webp", "image/gif": "gif", "image/heic": "heic",
+    "image/avif": "avif",
+    "audio/mpeg": "mp3", "audio/mp4": "m4a", "audio/aac": "aac",
+    "audio/ogg": "ogg", "audio/wav": "wav", "audio/x-wav": "wav",
+    "application/pdf": "pdf",
+}
+
+
+def is_instagram_page(url):
+    """True only for Instagram post/reel/story pages (these need RapidAPI)."""
+    p = urlparse(url)
+    host = (p.hostname or "").lower()
+    on_ig = any(host == h or host.endswith("." + h) for h in IG_HOSTS)
+    return on_ig and any(seg in p.path for seg in IG_PATHS)
+
+
+def _to_int(v):
+    try:
+        return int(float(v))
+    except Exception:
+        return 0
+
+
+def pick_best_url(meta):
+    """Highest quality URL. If RapidAPI returns several variants, pick the biggest."""
+    best_url, best_score = meta.get("download_url"), -1
+    for key in ("medias", "media", "formats", "links", "variants", "videos", "items"):
+        lst = meta.get(key)
+        if not isinstance(lst, list):
+            continue
+        for m in lst:
+            if not isinstance(m, dict):
+                continue
+            u = m.get("download_url") or m.get("url")
+            if not u:
+                continue
+            score = (_to_int(m.get("width")) * _to_int(m.get("height"))) \
+                or _to_int(m.get("bitrate")) or _to_int(m.get("size"))
+            if score > best_score:
+                best_url, best_score = u, score
+    return best_url
+
+
+def name_hint_from_url(url):
+    """asset_id for lookaside links, else short hash."""
+    q = parse_qs(urlparse(url).query)
+    if q.get("asset_id"):
+        return q["asset_id"][0]
+    return hashlib.sha1(url.encode()).hexdigest()[:12]
+
+
+def stream_to_r2(item_id, src_url, hint):
+    """Stream the ORIGINAL bytes to R2 (no re-encoding = no quality loss)."""
     with requests.get(
-        download_url, stream=True, timeout=(15, 120), headers={"User-Agent": UA}
+        src_url, stream=True, timeout=(15, 180), headers={"User-Agent": UA}
     ) as resp:
         resp.raise_for_status()
         resp.raw.decode_content = True
 
-        ctype = (resp.headers.get("Content-Type") or "video/mp4").split(";")[0].strip()
-        ext = (mimetypes.guess_extension(ctype) or ".mp4").lstrip(".")
-        if ext == "jpe":
-            ext = "jpg"
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        if ctype.startswith("text/") or ctype in ("application/json", "application/xml"):
+            raise RuntimeError(f"Link is not media (got {ctype}); it may be expired")
 
-        key = f"memories/{item_id}_{shortcode or int(time.time())}.{ext}"
+        ext = EXT_MAP.get(ctype)
+        if not ext:  # fallback: extension in URL path
+            path_ext = os.path.splitext(urlparse(src_url).path)[1].lstrip(".").lower()
+            ext = path_ext if 1 <= len(path_ext) <= 5 else "bin"
+        if not ctype or ctype == "application/octet-stream":
+            ctype = {"mp4": "video/mp4", "jpg": "image/jpeg", "png": "image/png"}.get(
+                ext, "application/octet-stream"
+            )
+
+        key = f"memories/{item_id}_{hint or int(time.time())}.{ext}"
         r2_client().upload_fileobj(
             resp.raw,
             CFG["R2_BUCKET"],
             key,
-            ExtraArgs={"ContentType": ctype},
+            ExtraArgs={
+                "ContentType": ctype,
+                "CacheControl": "public, max-age=31536000",
+            },
         )
     return f"{CFG['R2_PUBLIC_BASE']}/{key}"
 
@@ -151,25 +227,82 @@ def post_update(payload):
 # ============================== PROCESS ONE ITEM ==============================
 def process_item(item):
     item_id = item["id"]
-    insta_url = item["url"]
-    log.info(f"[{item_id}] start {insta_url}")
+    url = (item.get("url") or "").strip()
+    log.info(f"[{item_id}] start {url[:100]}")
 
-    meta = fetch_rapid(insta_url)
+    if is_instagram_page(url):
+        # Instagram reel/post link -> RapidAPI
+        meta = fetch_rapid(url)
 
-    # Save caption (only if API returned one and DB has none)
-    caption = (meta.get("caption") or "").strip()
-    if caption and not (item.get("caption") or "").strip():
-        post_update({"id": item_id, "caption": caption})
-        log.info(f"[{item_id}] caption saved")
+        caption = (meta.get("caption") or "").strip()
+        if caption and not (item.get("caption") or "").strip():
+            post_update({"id": item_id, "caption": caption})
+            log.info(f"[{item_id}] caption saved")
 
-    # Upload media to R2
-    public_url = upload_to_r2(item_id, meta["download_url"], meta.get("id"))
+        src_url = pick_best_url(meta)
+        hint = meta.get("id")
+        log.info(f"[{item_id}] source: rapidapi")
+    else:
+        # Direct media link (lookaside.fbsbx.com, CDN, image, etc.) -> download directly
+        src_url = url
+        hint = name_hint_from_url(url)
+        log.info(f"[{item_id}] source: direct link")
+
+    public_url = stream_to_r2(item_id, src_url, hint)
     log.info(f"[{item_id}] uploaded {public_url}")
 
     # Save Cloudflare URL LAST so failed items are retried next run
     post_update({"id": item_id, "cloudflermediaurl": public_url})
     log.info(f"[{item_id}] done")
     return public_url
+
+
+# ============================== SKIPPED TASKS (stored in R2, survives restarts) ==============================
+SKIP_KEY = "_state/skipped.json"
+
+
+def load_skipped():
+    try:
+        obj = r2_client().get_object(Bucket=CFG["R2_BUCKET"], Key=SKIP_KEY)
+        return json.loads(obj["Body"].read())
+    except Exception as e:
+        if "NoSuchKey" in str(e) or "404" in str(e):
+            return {}
+        raise
+
+
+def save_skipped(data):
+    r2_client().put_object(
+        Bucket=CFG["R2_BUCKET"],
+        Key=SKIP_KEY,
+        Body=json.dumps(data, ensure_ascii=False, indent=2).encode(),
+        ContentType="application/json",
+    )
+
+
+def is_skipped(item, skipped):
+    rec = skipped.get(str(item["id"]))
+    # if the URL was changed in the DB, give it a fresh start
+    return bool(rec) and rec.get("url") == item.get("url")
+
+
+# ============================== RETRY WRAPPER ==============================
+def process_with_retry(item):
+    """Try up to MAX_RETRIES times. If all fail, report skipped=True."""
+    max_try = CFG["MAX_RETRIES"]
+    last_err = ""
+    for attempt in range(1, max_try + 1):
+        try:
+            url = process_item(item)
+            return {"id": item["id"], "ok": True, "url": url, "attempts": attempt}
+        except Exception as e:
+            last_err = str(e)[:300]
+            log.warning(f"[{item.get('id')}] attempt {attempt}/{max_try} failed: {last_err}")
+            if attempt < max_try:
+                time.sleep(CFG["RETRY_DELAY"] * attempt)
+    log.error(f"[{item.get('id')}] FAILED {max_try} times -> skipped")
+    return {"id": item["id"], "ok": False, "skipped": True,
+            "attempts": max_try, "error": last_err}
 
 
 # ============================== BATCH RUNNER ==============================
@@ -184,15 +317,37 @@ def run_batch():
 
     results = []
     try:
+        skipped = load_skipped()
         pending = get_pending()
-        for item in pending[: CFG["BATCH_SIZE"]]:
-            try:
-                url = process_item(item)
-                results.append({"id": item["id"], "ok": True, "url": url})
-            except Exception as e:
-                log.exception(f"[{item.get('id')}] failed")
-                results.append({"id": item.get("id"), "ok": False, "error": str(e)})
-        return {"status": "success", "pending": len(pending), "processed": results}
+        todo = [i for i in pending if not is_skipped(i, skipped)]
+        changed = False
+
+        for item in todo[: CFG["BATCH_SIZE"]]:
+            res = process_with_retry(item)
+            results.append(res)
+            sid = str(item["id"])
+            if res["ok"]:
+                if skipped.pop(sid, None) is not None:
+                    changed = True
+            else:
+                skipped[sid] = {
+                    "url": item.get("url"),
+                    "error": res["error"],
+                    "attempts": res["attempts"],
+                    "time": datetime.now(timezone.utc).isoformat(),
+                }
+                changed = True
+
+        if changed:
+            save_skipped(skipped)
+
+        return {
+            "status": "success",
+            "pending": len(pending),
+            "waiting": max(len(todo) - CFG["BATCH_SIZE"], 0),
+            "skipped_total": len(skipped),
+            "processed": results,
+        }
     except Exception as e:
         log.exception("batch failed")
         return {"status": "error", "error": str(e)}
@@ -222,6 +377,31 @@ def cron():
 
     threading.Thread(target=run_batch, daemon=True).start()
     return jsonify(status="started")
+
+
+@app.route("/skipped")
+def skipped_list():
+    """List tasks skipped after all retries failed."""
+    if not authed():
+        abort(403)
+    data = load_skipped()
+    return jsonify(count=len(data), skipped=data)
+
+
+@app.route("/retry")
+def retry_skipped():
+    """/retry?key=SECRET&id=5  or  /retry?key=SECRET&all=1  -> put skipped task(s) back in the queue."""
+    if not authed():
+        abort(403)
+    data = load_skipped()
+    if request.args.get("all") == "1":
+        n = len(data)
+        data = {}
+    else:
+        rid = request.args.get("id", "")
+        n = 1 if data.pop(rid, None) is not None else 0
+    save_skipped(data)
+    return jsonify(status="ok", requeued=n, skipped_left=len(data))
 
 
 # ============================== HEALTH ==============================
@@ -317,6 +497,11 @@ def health():
     all_ok = api["ok"] and storage["ok"] and config["ok"]
     code = 200 if all_ok else 503
 
+    try:
+        skipped_count = len(load_skipped()) if (is_auth and storage["ok"]) else None
+    except Exception:
+        skipped_count = None
+
     if not is_auth:  # public: simple status only
         return (
             jsonify(
@@ -334,6 +519,7 @@ def health():
             api=api,
             storage=storage,
             config=config,
+            skipped_count=skipped_count,
         ),
         code,
     )
