@@ -1,3 +1,5 @@
 flask
 requests
 boto3
+gunicorn
+python-dotenv
